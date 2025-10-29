@@ -151,7 +151,13 @@ bot.on("text", async (ctx) => {
         `Successfully processed ${urlInfo.platform} link for user ${userName}`
       );
     } else {
-      throw new Error(downloadResult.error || "Download failed");
+      // Check if this is a special Instagram fallback case
+      if (downloadResult.fallbackMessage) {
+        await ctx.reply(downloadResult.fallbackMessage, { parse_mode: 'Markdown' });
+        logger.info(`Sent Instagram fallback message to user ${userName}`);
+      } else {
+        throw new Error(downloadResult.error || 'Download failed');
+      }
     }
   } catch (error) {
     logger.error(

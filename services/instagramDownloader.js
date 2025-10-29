@@ -23,16 +23,48 @@ class InstagramDownloader {
       let mediaData;
 
       try {
-        // Try rapid API method first
-        mediaData = await this.downloadWithRapidAPI(url);
+        // Try rapid API method first (if configured)
+        if (process.env.RAPIDAPI_KEY) {
+          mediaData = await this.downloadWithRapidAPI(url);
+        } else {
+          throw new Error("RapidAPI key not configured");
+        }
       } catch (error) {
         logger.warn("RapidAPI method failed, trying scraping method");
-        // Fallback to web scraping
-        mediaData = await this.downloadWithScraping(url);
+        
+        try {
+          // Fallback to web scraping
+          mediaData = await this.downloadWithScraping(url);
+        } catch (scrapingError) {
+          logger.warn("Web scraping failed, trying alternative method");
+          // Try alternative simple method
+          mediaData = await this.downloadWithSimpleMethod(url);
+        }
       }
 
       if (!mediaData) {
-        throw new Error("Could not extract media from Instagram post");
+        // If all download methods fail, return helpful information instead
+        return {
+          success: false,
+          error: "Instagram_Protection_Detected",
+          fallbackMessage: `🔗 **Instagram Link Detected!**
+
+📱 **Original URL:** ${url}
+
+⚠️ Instagram has strong anti-bot protections that prevent automated downloads.
+
+**💡 How to download manually:**
+1. Open the link in your browser
+2. Right-click on the video/image
+3. Select "Save video as..." or "Save image as..."
+
+**🔄 Alternative options:**
+• Try using a browser extension
+• Use Instagram's "Save" feature
+• Share to other apps from Instagram directly
+
+**Note:** This protection helps keep Instagram secure! 🛡️`
+        };
       }
 
       // Download the media file
@@ -41,14 +73,49 @@ class InstagramDownloader {
       }`;
       const filePath = path.join(this.downloadsDir, fileName);
 
-      await this.downloadFile(mediaData.mediaURL, filePath);
+      try {
+        await this.downloadFile(mediaData.mediaURL, filePath);
 
-      return {
-        success: true,
-        type: mediaData.type,
-        filePath: filePath,
-        caption: mediaData.caption || "Downloaded from Instagram",
-      };
+        // Verify file was downloaded successfully
+        const stats = await fs.stat(filePath);
+        if (stats.size === 0) {
+          await fs.remove(filePath);
+          throw new Error("Downloaded file is empty");
+        }
+
+        logger.info(`Successfully downloaded Instagram media: ${mediaData.type}, size: ${Math.round(stats.size / 1024)}KB`);
+
+        return {
+          success: true,
+          type: mediaData.type,
+          filePath: filePath,
+          caption: mediaData.caption || "Downloaded from Instagram",
+        };
+      } catch (downloadError) {
+        // If download fails due to 403 or similar, provide helpful fallback
+        logger.warn(`Download blocked by Instagram: ${downloadError.message}`);
+        
+        return {
+          success: false,
+          error: "Instagram_Download_Blocked",
+          fallbackMessage: `🔗 **Instagram Media Found!**
+
+📱 **Direct Link:** ${mediaData.mediaURL}
+
+❌ **Download blocked by Instagram's protection**
+
+**💡 You can still access the media:**
+1. Click the link above to view
+2. Long-press on mobile to save
+3. Right-click on desktop to save
+
+**🎯 Media Info:**
+• Type: ${mediaData.type}
+• Caption: ${mediaData.caption || 'No caption'}
+
+Instagram protects content from automated downloads, but you can still save it manually! 📥`
+        };
+      }
     } catch (error) {
       logger.error(`Instagram download error: ${error.message}`);
       return {
@@ -59,9 +126,12 @@ class InstagramDownloader {
   }
 
   isValidInstagramURL(url) {
-    const instagramRegex =
-      /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv)\/[A-Za-z0-9_-]+/;
-    return instagramRegex.test(url);
+    const instagramRegexes = [
+      /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv)\/[A-Za-z0-9_-]+/,
+      /^https?:\/\/(www\.)?instagram\.com\/stories\/[A-Za-z0-9_.]+\/\d+/
+    ];
+    
+    return instagramRegexes.some(regex => regex.test(url));
   }
 
   async downloadWithRapidAPI(url) {
@@ -106,100 +176,196 @@ class InstagramDownloader {
     let browser;
 
     try {
-      // Launch puppeteer browser
+      // Clean the URL first
+      const cleanUrl = this.cleanInstagramURL(url);
+      logger.info(`Cleaned Instagram URL: ${cleanUrl}`);
+
+      // Launch puppeteer browser with better settings
       browser = await puppeteer.launch({
         headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-web-security",
+          "--disable-features=VizDisplayCompositor",
+          "--disable-blink-features=AutomationControlled",
+          "--no-first-run",
+          "--disable-extensions",
+          "--disable-plugins",
+          "--disable-images"
+        ],
       });
 
       const page = await browser.newPage();
 
-      // Set user agent to avoid bot detection
+      // Set better user agent and viewport
       await page.setUserAgent(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       );
+      await page.setViewport({ width: 1366, height: 768 });
+
+      // Set extra headers
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+      });
 
       // Navigate to Instagram post
-      await page.goto(url, { waitUntil: "networkidle0", timeout: 30000 });
+      logger.info(`Navigating to: ${cleanUrl}`);
+      await page.goto(cleanUrl, { 
+        waitUntil: "domcontentloaded", 
+        timeout: 30000 
+      });
 
       // Wait for content to load
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(5000);
 
-      // Extract media data from the page
-      const mediaData = await page.evaluate(() => {
-        // Look for video element first
-        const videoElement = document.querySelector("video");
-        if (videoElement && videoElement.src) {
+      // First try to get media from meta tags (more reliable)
+      let mediaData = await page.evaluate(() => {
+        // Check for video meta tags first
+        const videoMetaUrl = document.querySelector('meta[property="og:video:url"]');
+        const videoMeta = document.querySelector('meta[property="og:video"]');
+        const imageMetaUrl = document.querySelector('meta[property="og:image"]');
+        
+        if (videoMetaUrl && videoMetaUrl.content) {
           return {
-            mediaURL: videoElement.src,
+            mediaURL: videoMetaUrl.content,
             type: "video",
-            caption:
-              document.querySelector('[data-testid="post-text"]')?.innerText ||
-              "",
+            caption: document.querySelector('meta[property="og:description"]')?.content || 
+                    document.querySelector('meta[name="description"]')?.content || ""
           };
         }
-
-        // Look for image element
-        const imageElement =
-          document.querySelector('img[alt*="Photo"]') ||
-          document.querySelector('img[style*="object-fit"]') ||
-          document.querySelector("article img");
-
-        if (
-          imageElement &&
-          imageElement.src &&
-          !imageElement.src.includes("avatar")
-        ) {
+        
+        if (videoMeta && videoMeta.content) {
           return {
-            mediaURL: imageElement.src,
-            type: "image",
-            caption:
-              document.querySelector('[data-testid="post-text"]')?.innerText ||
-              "",
+            mediaURL: videoMeta.content,
+            type: "video",
+            caption: document.querySelector('meta[property="og:description"]')?.content || 
+                    document.querySelector('meta[name="description"]')?.content || ""
           };
         }
-
+        
+        if (imageMetaUrl && imageMetaUrl.content && !imageMetaUrl.content.includes('avatar') && !imageMetaUrl.content.includes('profile')) {
+          return {
+            mediaURL: imageMetaUrl.content,
+            type: "image",
+            caption: document.querySelector('meta[property="og:description"]')?.content || 
+                    document.querySelector('meta[name="description"]')?.content || ""
+          };
+        }
+        
         return null;
       });
 
+      // If meta tags didn't work, try DOM scraping
       if (!mediaData) {
-        // Try alternative scraping method - look for meta tags
-        const metaData = await page.evaluate(() => {
-          const videoMeta = document.querySelector('meta[property="og:video"]');
-          const imageMeta = document.querySelector('meta[property="og:image"]');
-
-          if (videoMeta) {
-            return {
-              mediaURL: videoMeta.content,
-              type: "video",
-              caption:
-                document.querySelector('meta[property="og:description"]')
-                  ?.content || "",
-            };
+        logger.info('Meta tags failed, trying DOM scraping...');
+        
+        mediaData = await page.evaluate(() => {
+          // Look for video elements with more specific selectors
+          const videoSelectors = [
+            'video[src]',
+            'video source[src]',
+            '[role="button"] video',
+            'article video',
+            'div[style*="video"] video'
+          ];
+          
+          for (const selector of videoSelectors) {
+            const videoElement = document.querySelector(selector);
+            if (videoElement) {
+              const src = videoElement.src || (videoElement.querySelector('source') && videoElement.querySelector('source').src);
+              if (src && !src.includes('blob:')) {
+                return {
+                  mediaURL: src,
+                  type: "video",
+                  caption: this.extractCaption()
+                };
+              }
+            }
           }
 
-          if (imageMeta) {
-            return {
-              mediaURL: imageMeta.content,
-              type: "image",
-              caption:
-                document.querySelector('meta[property="og:description"]')
-                  ?.content || "",
-            };
+          // Look for image elements with better selectors
+          const imageSelectors = [
+            'article img[src*="cdninstagram"]',
+            'article img[src*="fbcdn"]',
+            'div[role="button"] img[src*="cdninstagram"]',
+            'img[src*="cdninstagram"]:not([src*="avatar"]):not([src*="profile"])',
+            'img[sizes][src*="instagram"]'
+          ];
+          
+          for (const selector of imageSelectors) {
+            const imageElement = document.querySelector(selector);
+            if (imageElement && imageElement.src && 
+                !imageElement.src.includes('avatar') && 
+                !imageElement.src.includes('profile') &&
+                imageElement.naturalWidth > 100) {
+              return {
+                mediaURL: imageElement.src,
+                type: "image",
+                caption: this.extractCaption()
+              };
+            }
           }
 
           return null;
         });
-
-        if (metaData) {
-          return metaData;
-        }
       }
 
+      // If still no media found, try alternative approach
+      if (!mediaData) {
+        logger.info('DOM scraping failed, trying alternative method...');
+        
+        // Try to find JSON data in page scripts
+        mediaData = await page.evaluate(() => {
+          const scripts = document.querySelectorAll('script');
+          
+          for (const script of scripts) {
+            if (script.textContent && script.textContent.includes('video_url')) {
+              try {
+                const match = script.textContent.match(/"video_url":"([^"]+)"/);
+                if (match) {
+                  return {
+                    mediaURL: match[1].replace(/\\u0026/g, '&').replace(/\\/g, ''),
+                    type: "video",
+                    caption: "Instagram Reel"
+                  };
+                }
+              } catch (e) {
+                continue;
+              }
+            }
+            
+            if (script.textContent && script.textContent.includes('display_url')) {
+              try {
+                const match = script.textContent.match(/"display_url":"([^"]+)"/);
+                if (match) {
+                  return {
+                    mediaURL: match[1].replace(/\\u0026/g, '&').replace(/\\/g, ''),
+                    type: "image",
+                    caption: "Instagram Post"
+                  };
+                }
+              } catch (e) {
+                continue;
+              }
+            }
+          }
+          
+          return null;
+        });
+      }
+
+      if (!mediaData) {
+        throw new Error("Could not extract media from Instagram post. The post might be private or the format has changed.");
+      }
+
+      logger.info(`Successfully extracted media: ${mediaData.type} - ${mediaData.mediaURL?.substring(0, 100)}...`);
       return mediaData;
+
     } catch (error) {
       logger.error(`Instagram scraping error: ${error.message}`);
-      throw new Error("Failed to scrape Instagram content");
+      throw new Error(`Failed to scrape Instagram content: ${error.message}`);
     } finally {
       if (browser) {
         await browser.close();
@@ -207,28 +373,139 @@ class InstagramDownloader {
     }
   }
 
+  async downloadWithSimpleMethod(url) {
+    try {
+      logger.info('Trying simple HTTP method...');
+      
+      const cleanUrl = this.cleanInstagramURL(url);
+      
+      // Try to get page content via simple HTTP request
+      const response = await axios.get(cleanUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        timeout: 15000
+      });
+
+      const html = response.data;
+      
+      // Try to extract media URLs from HTML
+      const videoMatch = html.match(/"video_url":"([^"]+)"/);
+      if (videoMatch) {
+        return {
+          mediaURL: videoMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, ''),
+          type: "video",
+          caption: "Instagram Reel"
+        };
+      }
+      
+      const imageMatch = html.match(/"display_url":"([^"]+)"/);
+      if (imageMatch) {
+        return {
+          mediaURL: imageMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, ''),
+          type: "image", 
+          caption: "Instagram Post"
+        };
+      }
+      
+      // Try meta tag extraction
+      const videoMetaMatch = html.match(/<meta property="og:video:url" content="([^"]+)"/);
+      if (videoMetaMatch) {
+        return {
+          mediaURL: videoMetaMatch[1],
+          type: "video",
+          caption: "Instagram Reel"
+        };
+      }
+      
+      const imageMetaMatch = html.match(/<meta property="og:image" content="([^"]+)"/);
+      if (imageMetaMatch && !imageMetaMatch[1].includes('avatar')) {
+        return {
+          mediaURL: imageMetaMatch[1],
+          type: "image",
+          caption: "Instagram Post"
+        };
+      }
+      
+      throw new Error("No media found in simple method");
+      
+    } catch (error) {
+      logger.error(`Simple method failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  cleanInstagramURL(url) {
+    try {
+      const urlObj = new URL(url);
+      // Remove utm parameters and other tracking
+      urlObj.searchParams.delete('utm_source');
+      urlObj.searchParams.delete('utm_medium');
+      urlObj.searchParams.delete('utm_campaign');
+      urlObj.searchParams.delete('utm_content');
+      urlObj.searchParams.delete('igshid');
+      
+      // Ensure we're using www subdomain
+      if (urlObj.hostname === 'instagram.com') {
+        urlObj.hostname = 'www.instagram.com';
+      }
+      
+      return urlObj.toString();
+    } catch (error) {
+      return url;
+    }
+  }
+
   async downloadFile(url, filePath) {
     try {
+      logger.info(`Downloading file from: ${url.substring(0, 100)}...`);
+      
       const response = await axios({
         method: "GET",
         url: url,
         responseType: "stream",
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Referer": "https://www.instagram.com/",
+          "Accept": "*/*",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Accept-Encoding": "gzip, deflate, br",
+          "DNT": "1",
+          "Connection": "keep-alive",
+          "Upgrade-Insecure-Requests": "1"
         },
+        timeout: 60000, // Increased timeout for large files
+        maxRedirects: 5
       });
+
+      if (response.status !== 200) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
 
       const writer = fs.createWriteStream(filePath);
       response.data.pipe(writer);
 
       return new Promise((resolve, reject) => {
-        writer.on("finish", resolve);
-        writer.on("error", reject);
+        writer.on("finish", () => {
+          logger.info(`File downloaded successfully: ${filePath}`);
+          resolve();
+        });
+        writer.on("error", (error) => {
+          logger.error(`File write error: ${error.message}`);
+          reject(error);
+        });
+        
+        // Add timeout for the download
+        setTimeout(() => {
+          writer.destroy();
+          reject(new Error('Download timeout'));
+        }, 60000);
       });
     } catch (error) {
       logger.error(`File download error: ${error.message}`);
-      throw new Error("Failed to download media file");
+      throw new Error(`Failed to download media file: ${error.message}`);
     }
   }
 }
