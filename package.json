@@ -1,0 +1,44 @@
+{
+    "name": "media-download-telegram-bot",
+    "version": "1.0.0",
+    "description": "A Telegram bot that downloads media from Instagram, Facebook, and LinkedIn",
+    "main": "bot.js",
+    "scripts": {
+        "start": "node bot.js",
+        "dev": "nodemon bot.js",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+        "telegram",
+        "bot",
+        "instagram",
+        "facebook",
+        "linkedin",
+        "media",
+        "downloader"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "telegraf": "^4.15.6",
+        "axios": "^1.6.0",
+        "puppeteer": "^21.5.2",
+        "ytdl-core": "^4.11.5",
+        "instagram-private-api": "^1.45.3",
+        "fs-extra": "^11.1.1",
+        "path": "^0.12.7",
+        "dotenv": "^16.3.1",
+        "winston": "^3.11.0",
+        "validator": "^13.11.0",
+        "cheerio": "^1.0.0-rc.12",
+        "node-fetch": "^3.3.2",
+        "ffmpeg-static": "^5.2.0",
+        "sharp": "^0.32.6"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.1"
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    }
+}
